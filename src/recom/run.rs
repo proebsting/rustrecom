@@ -159,23 +159,26 @@ fn start_job_thread(
         let mut proposals = Vec::<(usize, RecomProposal)>::new();
         for _ in 0..next.n_steps {
             // loop allows retries for non-reversible ReCom
-            loop {
+            'emit: loop {
                 // Step 1: sample a pair of adjacent districts.
                 let (dist_a, dist_b);
                 if sample_district_pairs {
                     // Sample a pair of districts uniformly at random, self-looping if an
                     // adjacent pair is not found.
-                    match uniform_dist_pair(&graph, &mut partition, &mut rng) {
-                        Some((a, b)) => {
-                            dist_a = a;
-                            dist_b = b;
-                        }
-                        None => {
-                            if reversible {
-                                counts.inc(SelfLoopReason::NonAdjacent);
-                                break; // success
-                            } else {
-                                continue; // retry
+                    'retry_district_pairs: loop {
+                        match uniform_dist_pair(&graph, &mut partition, &mut rng) {
+                            Some((a, b)) => {
+                                dist_a = a;
+                                dist_b = b;
+                                break 'retry_district_pairs; // found a pair!
+                            }
+                            None => {
+                                if reversible {
+                                    counts.inc(SelfLoopReason::NonAdjacent);
+                                    break 'emit; // success, emit self-loop
+                                } else {
+                                    continue 'retry_district_pairs; // must try another pair
+                                }
                             }
                         }
                     }
@@ -199,60 +202,62 @@ fn start_job_thread(
                     partition.subgraph(&graph, &mut subgraph_buf, dist_a, dist_b);
                 }
 
-                // Step 2: draw a random spanning tree of the subgraph induced by the
-                // two districts.
-                st_sampler.random_spanning_tree(&subgraph_buf.graph, &mut st_buf, &mut rng);
+                'retry_split: for _ in 0..10000 {
+                    // Step 2: draw a random spanning tree of the subgraph induced by the
+                    // two districts.
+                    st_sampler.random_spanning_tree(&subgraph_buf.graph, &mut st_buf, &mut rng);
 
-                // Step 3: choose a random balance edge, if possible.
-                let split = random_split(
-                    &subgraph_buf.graph,
-                    &mut rng,
-                    &st_buf.st,
-                    dist_a,
-                    dist_b,
-                    &mut split_buf,
-                    &mut proposal_buf,
-                    &subgraph_buf.raw_nodes,
-                    &params,
-                );
-                match split {
-                    Ok(n_splits) => {
-                        if reversible {
-                            // Step 4: accept any particular edge with probability 1 / (M * seam length)
-                            let seam_length = proposal_buf.seam_length(&graph);
-                            let prob =
-                                (n_splits as f64) / (seam_length as f64 * params.balance_ub as f64);
-                            if prob > 1.0 {
-                                panic!(
-                                    "Invalid state: got {} splits, seam length {}",
-                                    n_splits, seam_length
-                                );
-                            }
-                            if rng.gen::<f64>() < prob {
-                                // the proposal needs to have a unique identifier so that when the
-                                // packets finish, the selected plan is close to deterministic
-                                // chance of a single batch getting duplicate numbers is near zero 
-                                // for batches of size < 1M and n_cores < 10k over a 1B run
-                                proposals.push((rng.gen(), proposal_buf.clone()));
+                    // Step 3: choose a random balance edge, if possible.
+                    let split = random_split(
+                        &subgraph_buf.graph,
+                        &mut rng,
+                        &st_buf.st,
+                        dist_a,
+                        dist_b,
+                        &mut split_buf,
+                        &mut proposal_buf,
+                        &subgraph_buf.raw_nodes,
+                        &params,
+                    );
+                    match split {
+                        Ok(n_splits) => {
+                            if reversible {
+                                // Step 4: accept any particular edge with probability 1 / (M * seam length)
+                                let seam_length = proposal_buf.seam_length(&graph);
+                                let prob =
+                                    (n_splits as f64) / (seam_length as f64 * params.balance_ub as f64);
+                                if prob > 1.0 {
+                                    panic!(
+                                        "Invalid state: got {} splits, seam length {}",
+                                        n_splits, seam_length
+                                    );
+                                }
+                                if rng.gen::<f64>() < prob {
+                                    // the proposal needs to have a unique identifier so that when the
+                                    // packets finish, the selected plan is close to deterministic
+                                    // chance of a single batch getting duplicate numbers is near zero 
+                                    // for batches of size < 1M and n_cores < 10k over a 1B run
+                                    proposals.push((rng.gen(), proposal_buf.clone()));
+                                } else {
+                                    counts.inc(SelfLoopReason::SeamLength);
+                                }
                             } else {
-                                counts.inc(SelfLoopReason::SeamLength);
+                                // Accept.
+                                proposals.push((rng.gen(), proposal_buf.clone()));
                             }
-                            break;  // success
-                        } else {
-                            // Accept.
-                            proposals.push((rng.gen(), proposal_buf.clone()));
-                            break;  // success
+                            break 'emit;  // RevReCom always succeeds, emit whatever we got
                         }
-                    }
-                    Err(_) => {
-                        if reversible {
-                            counts.inc(SelfLoopReason::NoSplit); // TODO: break out errors?
-                            break; // success
-                        } else {
-                            continue; // retry
+                        Err(_) => {
+                            if reversible {
+                                counts.inc(SelfLoopReason::NoSplit); // TODO: break out errors?
+                                break 'emit; // success, RevReCom always succeeds
+                            } else {
+                                continue 'retry_split; // retry spanning tree
+                            }
                         }
                     }
                 }
+                panic!("FATAL: Could not find a valid split after 10,000 tries.");
             }
         }
         result_send

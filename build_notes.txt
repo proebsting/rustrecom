@@ -1,0 +1,5 @@
+RUSTFLAGS="-C linker=x86_64-linux-musl-gcc -C relocation-model=static -C target-feature=+crt-static" cargo +nightly build --release -Z build-std=std,core,alloc,panic_abort --target x86_64-unknown-linux-gnu
+
+RUSTFLAGS="-C target-cpu=native"  cargo build --release
+
+rsync target/x86_64-unknown-linux-gnu/release/frcw proebsting@filexfer.hpc.arizona.edu:frcw.x86
